@@ -174,3 +174,95 @@ dummy_input = torch.tensor([
 output = token_embedding(dummy_input)
 print(f"Input shape:  {dummy_input.shape}")  
 print(f"Output shape: {output.shape}")  
+
+# -------------------------------------------------------
+# 1. Positional Embedding
+# -------------------------------------------------------
+
+class PositionalEmbedding(nn.Module):
+    def __init__(self, embed_dim, max_length=128):
+        super().__init__()
+        self.position_embedding = nn.Embedding(max_length, embed_dim)
+        #learnable position vectors, one per position (0 to max_length-1)
+        #creates lookup table with 128 rows (one per position) and 128 columns (one number per dimension)
+    
+    def forward(self, x): #x is output from token embedding
+        batch_size, seq_length, _ = x.shape
+        #x shape: [batch_size, seq_length, embed_dim]
+
+        positions = torch.arange(seq_length)
+        #create position indices [0,1,2,...,seq_length-1]
+        #position 0 is [CLS] token, position 1 is the first atom...
+
+        pos_embeddings = self.position_embedding(positions)
+        #look up position vectors
+        #result matrix: [seq_length, embed_dim]
+        #so each position returns its 128-number vector
+        
+        return x + pos_embeddings
+        #add position embeddings to token embeddings
+        #pos_embeddings gets broadcast across the batch dimension
+
+
+
+# -------------------------------------------------------
+# 2. Combined Embedding (Token + Positional)
+# -------------------------------------------------------
+
+class MoleculeEmbedding(nn.Module):
+    def __init__(self, vocab_size, embed_dim, max_length=128, dropout=0.1):
+        super().__init__()
+        self.token_embedding = TokenEmbedding(vocab_size, embed_dim) #token IDs to vectors
+        self.positional_embedding = PositionalEmbedding(embed_dim, max_length) #position indicies to vectors and adds the token vectors
+        self.dropout = nn.Dropout(dropout) #creates a dropout layer with 10% of values set to 0 randomly, prevents overfitting
+        #during evaluation, dropout is automatically turned off
+
+    def forward(self, input_ids):
+        #input_ids shape: [batch_size, seq_length]
+
+        #step 1: convert token IDs to vectors 
+        token_embeds = self.token_embedding(input_ids)
+        #shape: [batch_size, seq_length, embed_dim]
+
+        #step 2: add positional info
+        x = self.positional_embedding(token_embeds)
+        #shape: [batch_size, seq_length, embed_dim]
+
+        #step 3: dropout 
+        x = self.dropout(x)
+
+        return x
+        
+
+# -------------------------------------------------------
+# 3. Apply to dataset
+# -------------------------------------------------------
+
+MAX_LENGTH = 128
+EMBED_DIM = 128
+DROPOUT = 0.1
+
+#initialize the combined embedding
+embedding_layer = MoleculeEmbedding(
+    vocab_size = VOCAB_SIZE,
+    embed_dim = EMBED_DIM,
+    max_length = MAX_LENGTH,
+    dropout = DROPOUT
+)
+
+#encode few molecules from dataset
+sample_smiles = df['smiles'].head(4).tolist()
+sample_encoded = torch.tensor([encode(smi, MAX_LENGTH) for smi in sample_smiles])
+#shape: [4, 128]
+
+print(f"Encoded input shape: {sample_encoded.shape}")
+
+#pass through combined embedding
+sample_embedded = embedding_layer(sample_encoded)
+print(f"Embedded output shape: {sample_embedded.shape}")
+
+# sanity check: [CLS] token is always at position 0
+print(f"\n[CLS] token index in first molecule: {sample_encoded[0][0].item()} (should be {CLS_IDX})")
+print(f"[CLS] embedding vector (first 5 values): {sample_embedded[0][0][:5].detach().numpy()}")
+
+
