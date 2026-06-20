@@ -5,7 +5,10 @@ from torch.utils.data import Dataset
 import pandas as pd
 import math
 
-#VOCABULARY
+# ============================================================
+# VOCABULARY
+# ============================================================
+
 SMILES_TOKENS = [
     '[PAD]', '[CLS]', '[UNK]', '[MASK]',   # special tokens
     'C', 'N', 'O', 'S', 'F', 'P',          # common atoms
@@ -39,7 +42,10 @@ VOCAB_SIZE = len(SMILES_TOKENS)
 
 print(f"Vocabulary size: {VOCAB_SIZE}")
 
-#TOKENIZER
+# ============================================================
+# TOKENIZER
+# ============================================================
+
 #regex pattern: tries to match two-char atoms first (Cl, Br, Si, Se),
 #then single-char atoms and symbols
 SMILES_PATTERN = re.compile(
@@ -92,7 +98,11 @@ def decode(indicies):
             tokens.append(token)
     return ''.join(tokens)
 
-#TEST
+
+# ============================================================
+# TOKENIZER TESTS
+# ============================================================
+
 test_smiles = [
     'CCO',                          # ethanol
     'CC(=O)O',                      # acetic acid
@@ -110,6 +120,11 @@ for smi in test_smiles:
     print(f"Tokens:  {tokens}")
     print(f"Encoded: {encoded[:len(tokens)+2]}...")
     print(f"Decoded: {decoded}")
+    
+
+# ============================================================
+# DATASET LOADING
+# ============================================================
 
 df = pd.read_csv("/kaggle/input/datasets/simonacholakova/pubchem-data/pubchem_10m.csv")
 
@@ -122,3 +137,40 @@ print(df[["smiles", "tokens"]].head())
 
 print(df["tokens"][1])
 
+# ============================================================
+# EMBEDDING LAYER
+# ============================================================
+
+class TokenEmbedding(nn.Module): #inherits from nn.Module
+    def __init__(self, vocab_size, embed_dim): #constructor 
+        super().__init__() #initializes the parent class (nn.Module)
+        self.embedding = nn.Embedding(
+            vocab_size, #number of unique tokens in the vocabulary
+            embed_dim,  #size of each embedding vector
+            padding_idx=PAD_IDX #just leave it as vector of zeros
+        )
+        #self.embedding: stores the layer as a member variable of the class
+        #nn.Embedding: creates a lookup table
+
+    def forward(self, input_ids):
+        return self.embedding(input_ids) 
+    #input_ids are the token ids
+    #PyTorch automatically replaces each token ID with its vector
+
+# ============================================================
+# EMBEDDING TESTS
+# ============================================================
+
+EMBED_DIM = 128  #size of each token vector
+
+token_embedding = TokenEmbedding(vocab_size=VOCAB_SIZE, embed_dim=EMBED_DIM)
+
+# simulate a batch of 2 molecules, each with max_length=128 tokens
+dummy_input = torch.tensor([
+    encode('CCO'),           # ethanol
+    encode('c1ccccc1'),      # benzene
+])
+
+output = token_embedding(dummy_input)
+print(f"Input shape:  {dummy_input.shape}")  
+print(f"Output shape: {output.shape}")  
