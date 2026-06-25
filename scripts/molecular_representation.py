@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset
 import pandas as pd
-import math
 
 # ============================================================
 # VOCABULARY
@@ -16,8 +15,6 @@ SMILES_TOKENS = [
     'c', 'n', 'o', 's', 'p',               # aromatic atoms (lowercase)
     '=', '#', '-', '/', '\\',              # bond types
     '(', ')',                              # branches
-    '[', ']',                              # bracket atoms
-    '+', '-',                              # charges (inside brackets)
     '1', '2', '3', '4', '5', '6',          # ring closures
     '7', '8', '9', '%',                    # more ring closures
     '@', 'H',                              # chirality and hydrogen
@@ -266,3 +263,61 @@ print(f"\n[CLS] token index in first molecule: {sample_encoded[0][0].item()} (sh
 print(f"[CLS] embedding vector (first 5 values): {sample_embedded[0][0][:5].detach().numpy()}")
 
 
+# ============================================================
+# TRANSFORMER ENCODER
+# ============================================================
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, embed_dim, num_heads, dropout=0.1):
+        super().__init__()
+
+        assert embed_dim % num_heads == 0 
+        #embed_dim must be divisible by num_heads because we split we split embedding into num_heads pieces
+
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads #size of each head
+
+        #linear layers to project input into Q, K, V
+        self.query = nn.Linear(embed_dim, embed_dim) #query projection
+        self.key = nn.Linear(embed_dim, embed_dim) #key projection
+        self.value = nn.Linear(embed_dim, embed_dim) #value projection
+        self.output = nn.Linear(embed_dim, embed_dim) #output projection, final layer
+
+        self.dropout = nn.Dropout(dropout)
+
+        self.scale = math.sqrt(self.head_dim) #scaling factor to prevent large dot products 
+
+        def forward(self, x, attention_mask=None):
+        #x shape: [batch_size, seq_length, embed_dim]
+            batch_size, seq_length, embed_dim = x.shape
+
+        #Step 1: compute Q, K, V
+        Q = self.query(x)
+        K = self.key(x)
+        V = self.value(x)
+
+        #Step 2: split into multiple heads
+        #[batch_size, seg_length, embed_dim] 
+        #to [batch_size, seq_length, num_heads, head_dim]
+        #to [batch_size, num_heads, seq_length, head_dim]
+        Q = Q.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1,2)
+        K = K.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1,2)
+        V = V.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1,2)
+
+        #Step 3: compute attention scores
+        #shape: [batch_size, num_heads, seq_length, seq_length]
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
+
+        #Step 4: apply attention mask, hide padding tokens
+        #attention_mask: [batch_size, seq_length]
+        #1 means real token, 0 means padding
+        #padding positions have score -infinity, so after softmax they become 0 (no attention to padding)
+        mask = attention_mask.unsqueeze(1).unsqueeze(2)
+        #shape: [batch_size, 1, 1, seq_length]
+        scores = scores.masked_fill(mask == 0, float('-inf'))
+
+        #Step 5: softmax to get attention weights
+        #converts scores to probabilities (0-1, sum to 1)
+        attention_weights = torch.softmax(scores, dim=1)
+        attention_weights = self.dropout(attention_weights)
