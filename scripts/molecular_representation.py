@@ -267,6 +267,10 @@ print(f"[CLS] embedding vector (first 5 values): {sample_embedded[0][0][:5].deta
 # TRANSFORMER ENCODER
 # ============================================================
 
+# ============================================================
+# TRANSFORMER ENCODER
+# ============================================================
+
 class MultiHeadAttention(nn.Module):
     def __init__(self, embed_dim, num_heads, dropout=0.1):
         super().__init__()
@@ -319,5 +323,21 @@ class MultiHeadAttention(nn.Module):
 
         #Step 5: softmax to get attention weights
         #converts scores to probabilities (0-1, sum to 1)
-        attention_weights = torch.softmax(scores, dim=1)
+        attention_weights = torch.softmax(scores, dim = -1)
         attention_weights = self.dropout(attention_weights)
+
+        #Step 6: weighted sum of values
+        #shape: [batch_size, num_heads, seq_length, head_dim]
+        attended = torch.matmul(attention_weights, V)
+
+        #Step 7: concatenate heads back toogether
+        #[batch_size, seq_length, num_heads, head_dim]
+        #to [batch_size, seq_length, embed_dim]
+        attended = attended.transpose(1,2).contigious()
+        attended = attended.view(batch_size, seq_length, embed_dim)
+
+        #Step 8: final linear projection
+        output = self.output(attended)
+        #shape: [batch_size, seq_length, embed_dim]
+        return output
+        
