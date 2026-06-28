@@ -386,3 +386,41 @@ class EncoderLayer(nn.Module):
         f_forward = self.feed_forward(x)
         x = self.norm2(x + self.dropout(f_forward))
         return x
+    
+
+class TransformerEncoder(nn.Module):
+    def __init__(self, vocab_size, embed_dim, num_heads, ff_dim, 
+                 num_layers, max_length=128, dropout=0.1):
+        super().__init__()
+
+        #embedding layer (token + positional)
+        self.embedding = MoleculeEmbedding(vocab_size, embed_dim, max_length, dropout)
+
+        #N encoder layers
+        self.layers = nn.ModuleList([
+            EncoderLayer(embed_dim, num_heads, ff_dim, dropout)
+            for _ in range(num_layers)
+        ])
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, input_ids, attention_mask=None):
+        #input_ids shape: [batch_size, seq_length]
+
+        #step 1: embed tokens + positions
+        x = self.embedding(input_ids)
+        #shape: [batch_size, seq_length, embed_dim]
+
+        #step 2: pass through each encoder layer in sequence 
+        for layer in self.layers:
+            x = layer(x, attention_mask)
+        #shape: [batch_size, seq_length, embed_dim]
+
+        #step 3: extract [CLS] token vector (position 0)
+        cls_output = x[:, 0, :]
+        # shape: [batch_size, embed_dim]
+
+        return cls_output
+        #this single vector per molecule is what goes into
+        #the prediction head for toxicity prediction
+        
