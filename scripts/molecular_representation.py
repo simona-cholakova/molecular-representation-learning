@@ -341,3 +341,21 @@ class MultiHeadAttention(nn.Module):
         #shape: [batch_size, seq_length, embed_dim]
         return output
         
+
+class FeedForward(nn.Module):
+    def __init__(self, embed_dim, ff_dim, dropout=0.1):
+        super().__init__()
+        #2 linear layers with relu in between
+        #ff_dim is typically 4x embed_dim (expand then compress)
+        self.linear1 = nn.Linear(embed_dim, ff_dim) #expand
+        self.relu = nn.ReLU()
+        self.linear2 = nn.Linear(ff_dim, embed_dim) #compress back
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        #x shape: [batch_size, seq_length, embed_dim]
+        x = self.linear1(x) #[batch_size, seq_length, ff_dim]
+        x = self.relu(x) 
+        x = self.dropout(x)
+        x = self.loinear2(x) #[batch_size, seq_length, embed_dim]
+        return x
