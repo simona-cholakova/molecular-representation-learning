@@ -121,10 +121,10 @@ for smi in test_smiles:
     
 
 # ============================================================
-# DATASET LOADING
+# PUBCHEM DATASET LOADING
 # ============================================================
 
-df = pd.read_csv("/kaggle/input/datasets/simonacholakova/pubchem-data/pubchem_10m.csv")
+df = pd.read_csv("data\pubchem_10m.csv")
 
 print(df.columns)
 print(df.head())
@@ -541,3 +541,102 @@ print(predictions[0].detach().numpy())
 
 total_params = sum(p.numel() for p in model.parameters())
 print(f"\nTotal trainable parameters: {total_params:,}")
+
+
+# ============================================================
+# LOAD TOXRIC ENDPOINT
+# ============================================================
+
+toxric = pd.read_csv('data\Acute Toxicity_mouse_oral_LD50.csv')
+
+print(f"Total compounds: {len(toxric)}")
+print(f"Columns: {toxric.columns.tolist()}")
+print(f"Null values in target: {toxric['mouse_oral_LD50'].isna().sum()}")
+print(f"\nTarget statistics:")
+print(toxric['mouse_oral_LD50'].describe())
+
+#drop rows with missing smiles or target
+toxric = toxric.dropna(subset=['Canonical SMILES', 'mouse_oral_LD50'])
+print(f"\nAfter dropping nulls: {len(toxric)} compounds")
+
+# ============================================================
+# TOXRIC DATASET
+# ============================================================
+
+class ToxicityDataset(Dataset):
+    def __init__(self, smiles_list, labels, max_length=128):
+        self.smiles_list = smiles_list
+        self.labels = labels
+        self.max_length = max_length
+
+    def __len__(self):
+        return len(self.smiles_list)
+
+    def __getitem(self, idx):
+        smi = self.smiles_list[idx]
+        encoded = encode(smi, self.max_length)
+
+        input_ids = torch.tensor(encoded, dtype=torch.long)
+        attention_mask = (input_ids != PAD_IDX).long()
+        label = torch.tensor(self.labels[idx], dtype=torch.float32)
+
+        return {
+            'input_ids': input_ids,
+            'attention_mask': attention_mask,
+            'label': label
+        }
+    
+# ============================================================
+# TRAIN / VALIDATION / TEST SPLIT
+# ============================================================
+
+smiles = toxric['Canonical SMILES'].tolist()
+labels = toxric['mouse_oral_LD50'].values
+
+#70% train, 15% validation, 15% test
+idx = np.arange(len(smiles))
+idx_train, idx_temp = train_test_split(idx, test_size=0.3, random_state=42)
+idx_val, idx_test = train_test_split(idx_temp, test_size=0.5, random_state=42)
+
+print(f"\nTrain: {len(idx_train)} compounds")
+print(f"Validation: {len(idx_val)} compounds")
+print(f"Test: {len(idx_test)} compounds")
+
+#normalized labels using train set mean and std
+#so the model predicts in a stable numerical range
+train_labels = labels[idx_train]
+label_mean = train_labels.mean()
+label_std = train_labels.std()
+
+print(f"\nLabel mean: {label_mean:.4f}")
+print(f"Label std: {label_std:.4f}")
+
+labels_norm = (labels - label_mean) / label_std
+
+#create datasets
+train_dataset = ToxicityDataset(
+    [smiles[i] for i in idx_train],
+    labels_norm[idx_train],
+    max_length=MAX_LENGTH
+)
+val_dataset = ToxicityDataset(
+    [smiles[i] for i in idx_val],
+    labels_norm[idx_val],
+    max_length=MAX_LENGTH
+)
+test_dataset = ToxicityDataset(
+    [smiles[i] for i in idx_test],
+    labels_norm[idx_test],
+    max_length=MAX_LENGTH
+)
+
+#create dataloaders
+BATCH_SIZE = 32
+
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+print(f"\nTrain batches: {len(train_loader)}")
+print(f"Validation batches: {len(val_loader)}")
+print(f"Test batches: {len(test_loader)}")
