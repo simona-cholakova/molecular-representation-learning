@@ -268,9 +268,6 @@ print(f"[CLS] embedding vector (first 5 values): {sample_embedded[0][0][:5].deta
 # TRANSFORMER ENCODER
 # ============================================================
 
-# ============================================================
-# TRANSFORMER ENCODER
-# ============================================================
 
 class MultiHeadAttention(nn.Module):
     def __init__(self, embed_dim, num_heads, dropout=0.1):
@@ -430,6 +427,7 @@ class TransformerEncoder(nn.Module):
 # ============================================================
 # TRANSFORMER TEST
 # ============================================================
+
 EMBED_DIM  = 128
 NUM_HEADS  = 8
 FF_DIM     = 512
@@ -463,4 +461,83 @@ print(cls_vectors[0][:5].detach().numpy())
 
 #count parameters
 total_params = sum(p.numel() for p in transformer.parameters())
+print(f"\nTotal trainable parameters: {total_params:,}")
+
+# ============================================================
+# PREDICTION HEAD
+# ============================================================
+
+class ToxicityPredictor(nn.Module):
+    def __init__(self, embed_dim, num_tasks, dropout=0.1):
+        #num_tasks is the number of values to be predicted (7 LD50)
+        super().__init__()
+        #takes the 128 number CLS vector and maps it to num_tasks outputs
+        self.predictor = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 2), #128->64
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim //2, num_tasks) #64->7
+        )
+        #nn.Sequential runs the layers automatically one after another
+    
+    def forward(self, cls_vector):
+        #cls_vector shape: [batch_size, embed_dim]
+        return self.predictor(cls_vector)
+        #output shape: [batch_size, num_tasks]
+
+# ============================================================
+# FULL MODEL (Transformer + Prediction Head)
+# ============================================================
+
+class MolecularToxicityModel(nn.Module):
+    def __init__(self, vocab_size, embed_dim, num_heads, ff_dim,
+                num_layers, num_tasks, max_length=128, dropout=0.1):
+        super().__init__()
+        self.encoder = TransformerEncoder(
+            vocab_size  = vocab_size,
+            embed_dim   = embed_dim,
+            num_heads   = num_heads,
+            ff_dim      = ff_dim,
+            num_layers  = num_layers,
+            max_length  = max_length,
+            dropout     = dropout
+        )
+        self.predictor = ToxicityPredictor(embed_dim, num_tasks, dropout)
+
+    def forward(self, input_ids, attention_mask=None):
+        #step 1: get molecule representation from transformer
+        cls_vector = self.encoder(input_ids, attention_mask)
+        #shape: [batch_size, embed_dim]
+
+        #step 2: predict toxicity values
+        predictions = self.predictor(cls_vector)
+        #shape: [batch_size, num_tasks]
+        return predictions
+    
+# ============================================================
+# TEST FULL MODEL
+# ============================================================
+
+NUM_TASKS = 7  #7 LD50 endpoints
+
+model = MolecularToxicityModel(
+    vocab_size  = VOCAB_SIZE,
+    embed_dim   = EMBED_DIM,
+    num_heads   = NUM_HEADS,
+    ff_dim      = FF_DIM,
+    num_layers  = NUM_LAYERS,
+    num_tasks   = NUM_TASKS,
+    max_length  = MAX_LENGTH,
+    dropout     = DROPOUT
+)
+
+#test forward pass
+predictions = model(sample_ids, sample_mask)
+
+print(f"CLS vector shape:   {cls_vectors.shape}")   #[4, 128]
+print(f"Predictions shape:  {predictions.shape}")   #[4, 7]
+print(f"\nPredictions for first molecule (7 LD50 values):")
+print(predictions[0].detach().numpy())
+
+total_params = sum(p.numel() for p in model.parameters())
 print(f"\nTotal trainable parameters: {total_params:,}")
