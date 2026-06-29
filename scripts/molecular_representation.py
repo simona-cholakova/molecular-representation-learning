@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset
 import pandas as pd
+import math
 
 # ============================================================
 # VOCABULARY
@@ -292,9 +293,9 @@ class MultiHeadAttention(nn.Module):
 
         self.scale = math.sqrt(self.head_dim) #scaling factor to prevent large dot products 
 
-        def forward(self, x, attention_mask=None):
+    def forward(self, x, attention_mask=None):
         #x shape: [batch_size, seq_length, embed_dim]
-            batch_size, seq_length, embed_dim = x.shape
+        batch_size, seq_length, embed_dim = x.shape
 
         #Step 1: compute Q, K, V
         Q = self.query(x)
@@ -317,9 +318,10 @@ class MultiHeadAttention(nn.Module):
         #attention_mask: [batch_size, seq_length]
         #1 means real token, 0 means padding
         #padding positions have score -infinity, so after softmax they become 0 (no attention to padding)
-        mask = attention_mask.unsqueeze(1).unsqueeze(2)
-        #shape: [batch_size, 1, 1, seq_length]
-        scores = scores.masked_fill(mask == 0, float('-inf'))
+        if attention_mask is not None:
+            mask = attention_mask.unsqueeze(1).unsqueeze(2)
+            #shape: [batch_size, 1, 1, seq_length]
+            scores = scores.masked_fill(mask == 0, float('-inf'))
 
         #Step 5: softmax to get attention weights
         #converts scores to probabilities (0-1, sum to 1)
@@ -333,7 +335,7 @@ class MultiHeadAttention(nn.Module):
         #Step 7: concatenate heads back toogether
         #[batch_size, seq_length, num_heads, head_dim]
         #to [batch_size, seq_length, embed_dim]
-        attended = attended.transpose(1,2).contigious()
+        attended = attended.transpose(1,2).contiguous()
         attended = attended.view(batch_size, seq_length, embed_dim)
 
         #Step 8: final linear projection
@@ -357,7 +359,7 @@ class FeedForward(nn.Module):
         x = self.linear1(x) #[batch_size, seq_length, ff_dim]
         x = self.relu(x) 
         x = self.dropout(x)
-        x = self.loinear2(x) #[batch_size, seq_length, embed_dim]
+        x = self.linear2(x) #[batch_size, seq_length, embed_dim]
         return x
     
 class EncoderLayer(nn.Module):
@@ -371,7 +373,7 @@ class EncoderLayer(nn.Module):
         self.norm1 = nn.LayerNorm(embed_dim)
         self.norm2 = nn.LayerNorm(embed_dim)
 
-        self.dropout = nn.Dropout()
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, attention_mask=None):
         #x shape: [batch_size, seq_length, embed_dim]
@@ -424,3 +426,41 @@ class TransformerEncoder(nn.Module):
         #this single vector per molecule is what goes into
         #the prediction head for toxicity prediction
         
+
+# ============================================================
+# TRANSFORMER TEST
+# ============================================================
+EMBED_DIM  = 128
+NUM_HEADS  = 8
+FF_DIM     = 512
+NUM_LAYERS = 4
+MAX_LENGTH = 128
+DROPOUT    = 0.1
+
+#build the transformer
+transformer = TransformerEncoder(
+    vocab_size  = VOCAB_SIZE,
+    embed_dim   = EMBED_DIM,
+    num_heads   = NUM_HEADS,
+    ff_dim      = FF_DIM,
+    num_layers  = NUM_LAYERS,
+    max_length  = MAX_LENGTH,
+    dropout     = DROPOUT
+)
+
+#test with 4 molecules from dataset
+sample_smiles = df['smiles'].head(4).tolist()
+sample_ids    = torch.tensor([encode(smi, MAX_LENGTH) for smi in sample_smiles])
+sample_mask   = (sample_ids != PAD_IDX).long()
+
+#forward pass
+cls_vectors = transformer(sample_ids, sample_mask)
+
+print(f"Input shape:      {sample_ids.shape}")    #should be [4, 128]
+print(f"CLS output shape: {cls_vectors.shape}")   #should be [4, 128]
+print(f"\nFirst molecule CLS vector (first 5 values):")
+print(cls_vectors[0][:5].detach().numpy())
+
+#count parameters
+total_params = sum(p.numel() for p in transformer.parameters())
+print(f"\nTotal trainable parameters: {total_params:,}")
