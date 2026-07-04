@@ -4,6 +4,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset
 import pandas as pd
 import math
+import os
 
 # ============================================================
 # VOCABULARY
@@ -513,34 +514,6 @@ class MolecularToxicityModel(nn.Module):
         predictions = self.predictor(cls_vector)
         #shape: [batch_size, num_tasks]
         return predictions
-    
-# ============================================================
-# TEST FULL MODEL
-# ============================================================
-
-NUM_TASKS = 7  #7 LD50 endpoints
-
-model = MolecularToxicityModel(
-    vocab_size  = VOCAB_SIZE,
-    embed_dim   = EMBED_DIM,
-    num_heads   = NUM_HEADS,
-    ff_dim      = FF_DIM,
-    num_layers  = NUM_LAYERS,
-    num_tasks   = NUM_TASKS,
-    max_length  = MAX_LENGTH,
-    dropout     = DROPOUT
-)
-
-#test forward pass
-predictions = model(sample_ids, sample_mask)
-
-print(f"CLS vector shape:   {cls_vectors.shape}")   #[4, 128]
-print(f"Predictions shape:  {predictions.shape}")   #[4, 7]
-print(f"\nPredictions for first molecule (7 LD50 values):")
-print(predictions[0].detach().numpy())
-
-total_params = sum(p.numel() for p in model.parameters())
-print(f"\nTotal trainable parameters: {total_params:,}")
 
 
 # ============================================================
@@ -585,58 +558,288 @@ class ToxicityDataset(Dataset):
             'attention_mask': attention_mask,
             'label': label
         }
-    
+
+
 # ============================================================
-# TRAIN / VALIDATION / TEST SPLIT
+# MLM PRETRAINING
 # ============================================================
 
-smiles = toxric['Canonical SMILES'].tolist()
-labels = toxric['mouse_oral_LD50'].values
+class MLMDataset(Dataset):
+    """
+    Takes SMILES strings, tokenizes them, randomly masks 15% of tokens,
+    and returns:
+    - input_ids: tokenized SMILES with some tokens replaced by [MASK]
+    - attention_mask: 1 for real tokens, 0 for padding
+    - labels: original token ids (-100 for unmasked positions,
+              real token id for masked positions)
+    """
 
-#70% train, 15% validation, 15% test
-idx = np.arange(len(smiles))
-idx_train, idx_temp = train_test_split(idx, test_size=0.3, random_state=42)
-idx_val, idx_test = train_test_split(idx_temp, test_size=0.5, random_state=42)
+    def __init__(self, smiles_list, max_length=128, mask_prob=0.15):
+        self.smiles_list = smiles_list
+        self.max_length = max_length
+        self.mask_prob = mask_prob
 
-print(f"\nTrain: {len(idx_train)} compounds")
-print(f"Validation: {len(idx_val)} compounds")
-print(f"Test: {len(idx_test)} compounds")
+    def __len__(self):
+        return len(self.smiles_list)
 
-#normalized labels using train set mean and std
-#so the model predicts in a stable numerical range
-train_labels = labels[idx_train]
-label_mean = train_labels.mean()
-label_std = train_labels.std()
+    def __getitem__(self, idx):
+        smi = self.smiles_list[idx]
+        encoded = encode(smi, self.max_length)  #list of token indices, length 128
 
-print(f"\nLabel mean: {label_mean:.4f}")
-print(f"Label std: {label_std:.4f}")
+        input_ids = encoded.copy()
+        labels = [-100] * self.max_length  #-100 = ignore in loss by default
 
-labels_norm = (labels - label_mean) / label_std
+        for i in range(self.max_length):
+            token_id = input_ids[i]
 
-#create datasets
-train_dataset = ToxicityDataset(
-    [smiles[i] for i in idx_train],
-    labels_norm[idx_train],
-    max_length=MAX_LENGTH
-)
-val_dataset = ToxicityDataset(
-    [smiles[i] for i in idx_val],
-    labels_norm[idx_val],
-    max_length=MAX_LENGTH
-)
-test_dataset = ToxicityDataset(
-    [smiles[i] for i in idx_test],
-    labels_norm[idx_test],
-    max_length=MAX_LENGTH
-)
+            #never mask special tokens or padding
+            if token_id in (PAD_IDX, CLS_IDX, UNK_IDX, MASK_IDX):
+                continue
 
-#create dataloaders
-BATCH_SIZE = 32
+            #randomly decide whether to mask this token
+            if torch.rand(1).item() < self.mask_prob:
+                labels[i] = token_id  #remember the original token for the loss
 
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
-test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+                r = torch.rand(1).item()
+                if r < 0.80:
+                    #80% replace with [MASK]
+                    input_ids[i] = MASK_IDX
+                elif r < 0.90:
+                    #10% replace with a random token
+                    input_ids[i] = torch.randint(4, VOCAB_SIZE, (1,)).item()
+                    #start from 4 to skip special tokens
+                #10% keep original token unchanged
+                #but still predict it in the loss
 
-print(f"\nTrain batches: {len(train_loader)}")
-print(f"Validation batches: {len(val_loader)}")
-print(f"Test batches: {len(test_loader)}")
+        return {
+            'input_ids': torch.tensor(input_ids, dtype=torch.long),
+            'attention_mask': torch.tensor(
+                [1 if t != PAD_IDX else 0 for t in input_ids],
+                dtype=torch.long
+            ),
+            'labels': torch.tensor(labels, dtype=torch.long)
+        }
+
+
+class MLMHead(nn.Module):
+    """
+    Prediction head for MLM pretraining.
+    Takes the full sequence output from the transformer encoder
+    (not just CLS) and predicts the original token at each masked position.
+    """
+
+    def __init__(self, embed_dim, vocab_size):
+        super().__init__()
+        self.dense = nn.Linear(embed_dim, embed_dim)
+        self.relu = nn.ReLU()
+        self.norm = nn.LayerNorm(embed_dim)
+        self.projector = nn.Linear(embed_dim, vocab_size)
+
+    def forward(self, x):
+        #x shape: [batch_size, seq_length, embed_dim]
+        x = self.dense(x)
+        x = self.relu(x)
+        x = self.norm(x)
+        x = self.projector(x)
+        #output shape: [batch_size, seq_length, vocab_size]
+        #for each position, a probability over every token in vocabulary
+        return x
+
+
+class TransformerEncoderForMLM(nn.Module):
+    """
+    Full encoder that returns ALL token outputs (not just CLS),
+    needed for MLM since we predict at every masked position.
+    """
+
+    def __init__(self, vocab_size, embed_dim, num_heads, ff_dim,
+                 num_layers, max_length=128, dropout=0.1):
+        super().__init__()
+        self.embedding = MoleculeEmbedding(
+            vocab_size, embed_dim, max_length, dropout)
+        self.layers = nn.ModuleList([
+            EncoderLayer(embed_dim, num_heads, ff_dim, dropout)
+            for _ in range(num_layers)
+        ])
+
+    def forward(self, input_ids, attention_mask=None):
+        x = self.embedding(input_ids)
+        for layer in self.layers:
+            x = layer(x, attention_mask)
+        return x  #[batch_size, seq_length, embed_dim]—ALL positions
+
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+
+class MLMModel(nn.Module):
+    """
+    Full MLM pretraining model:
+    encoder (learns representations) + MLM head (predicts masked tokens)
+    After pretraining, only the encoder is kept for fine-tuning.
+    """
+
+    def __init__(self, vocab_size, embed_dim, num_heads, ff_dim,
+                 num_layers, max_length=128, dropout=0.1):
+        super().__init__()
+        self.encoder = TransformerEncoderForMLM(
+            vocab_size, embed_dim, num_heads, ff_dim,
+            num_layers, max_length, dropout
+        )
+        self.mlm_head = MLMHead(embed_dim, vocab_size)
+
+    def forward(self, input_ids, attention_mask=None):
+        #get representations for all token positions
+        x = self.encoder(input_ids, attention_mask)
+        #predict token at each position
+        logits = self.mlm_head(x)
+        return logits
+        #shape: [batch_size, seq_length, vocab_size]
+
+
+# ============================================================
+# PRETRAINING SETUP
+# ============================================================
+
+PRETRAIN_SAMPLE = 10_000_000
+
+pubchem_smiles = df['smiles'].dropna().tolist()
+
+#shuffle and take sample
+import random
+
+random.seed(42)
+random.shuffle(pubchem_smiles)
+pubchem_smiles = pubchem_smiles[:PRETRAIN_SAMPLE]
+
+print(f"Pretraining on {len(pubchem_smiles):,} molecules")
+
+#split into train/val
+n_pretrain = int(0.95 * len(pubchem_smiles))
+pretrain_smiles = pubchem_smiles[:n_pretrain]
+preval_smiles = pubchem_smiles[n_pretrain:]
+
+pretrain_dataset = MLMDataset(pretrain_smiles, max_length=MAX_LENGTH)
+preval_dataset = MLMDataset(preval_smiles, max_length=MAX_LENGTH)
+
+pretrain_loader = DataLoader(
+    pretrain_dataset, batch_size=64, shuffle=True, num_workers=2)
+preval_loader = DataLoader(
+    preval_dataset, batch_size=64, shuffle=False, num_workers=2)
+
+print(f"Pretrain batches: {len(pretrain_loader):,}")
+print(f"Preval batches:   {len(preval_loader):,}")
+
+# ============================================================
+# PRETRAINING LOOP
+# ============================================================
+
+PRETRAIN_EPOCHS = 10
+PRETRAIN_LR = 1e-4
+
+mlm_model = MLMModel(
+    vocab_size=VOCAB_SIZE,
+    embed_dim=EMBED_DIM,
+    num_heads=NUM_HEADS,
+    ff_dim=FF_DIM,
+    num_layers=NUM_LAYERS,
+    max_length=MAX_LENGTH,
+    dropout=DROPOUT
+).to(device)
+
+pretrain_optimizer = torch.optim.Adam(
+    mlm_model.parameters(), lr=PRETRAIN_LR, weight_decay=1e-5)
+
+#CrossEntropyLoss with ignore_index=-100
+#so positions where labels=-100 (unmasked) don't contribute to loss
+criterion_mlm = nn.CrossEntropyLoss(ignore_index=-100)
+
+best_preval_loss = float('inf')
+
+for epoch in range(PRETRAIN_EPOCHS):
+
+    #train
+    mlm_model.train()
+    train_loss = 0.0
+    train_acc = 0.0
+    train_count = 0
+
+    for batch in pretrain_loader:
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        labels = batch['labels'].to(device)
+
+        pretrain_optimizer.zero_grad()
+
+        logits = mlm_model(input_ids, attention_mask)
+        #logits shape: [batch, seq_len, vocab_size]
+        #labels shape: [batch, seq_len]
+
+        #reshape for CrossEntropyLoss:
+        #expects [N, C] predictions and [N] targets
+        loss = criterion_mlm(
+            logits.view(-1, VOCAB_SIZE),
+            labels.view(-1)
+        )
+
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(mlm_model.parameters(), 1.0)
+        pretrain_optimizer.step()
+
+        #track accuracy on masked tokens only
+        masked_positions = labels.view(-1) != -100
+        if masked_positions.sum() > 0:
+            preds = logits.view(-1, VOCAB_SIZE).argmax(dim=-1)
+            correct = (preds[masked_positions] ==
+                       labels.view(-1)[masked_positions]).sum().item()
+            train_acc += correct
+            train_count += masked_positions.sum().item()
+
+        train_loss += loss.item()
+
+    train_loss /= len(pretrain_loader)
+    train_acc = train_acc / train_count if train_count > 0 else 0
+
+    #validate
+    mlm_model.eval()
+    val_loss = 0.0
+    val_acc = 0.0
+    val_count = 0
+
+    with torch.no_grad():
+        for batch in preval_loader:
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['labels'].to(device)
+
+            logits = mlm_model(input_ids, attention_mask)
+            loss = criterion_mlm(
+                logits.view(-1, VOCAB_SIZE),
+                labels.view(-1)
+            )
+            val_loss += loss.item()
+
+            masked_positions = labels.view(-1) != -100
+            if masked_positions.sum() > 0:
+                preds = logits.view(-1, VOCAB_SIZE).argmax(dim=-1)
+                correct = (preds[masked_positions] ==
+                           labels.view(-1)[masked_positions]).sum().item()
+                val_acc += correct
+                val_count += masked_positions.sum().item()
+
+    val_loss /= len(preval_loader)
+    val_acc = val_acc / val_count if val_count > 0 else 0
+
+    if val_loss < best_preval_loss:
+        best_preval_loss = val_loss
+        #save pretrained encoder weights
+        torch.save(mlm_model.encoder.state_dict(), 'pretrained_encoder.pt')
+        print(f"  → saved best encoder")
+
+    print(f"Epoch {epoch + 1:3d}/{PRETRAIN_EPOCHS}  "
+          f"Train Loss: {train_loss:.4f}  Acc: {train_acc:.3f}  "
+          f"Val Loss: {val_loss:.4f}  Acc: {val_acc:.3f}")
+
+print(f"\nPretraining complete. Best val loss: {best_preval_loss:.4f}")
+print(f"Pretrained encoder saved to: pretrained_encoder.pt")
