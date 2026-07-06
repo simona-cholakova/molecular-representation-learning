@@ -560,9 +560,9 @@ class ToxicityDataset(Dataset):
         }
 
 
-# ============================================================
-# MLM PRETRAINING
-# ============================================================
+# # ============================================================
+# # MLM PRETRAINING
+# # ============================================================
 
 class MLMDataset(Dataset):
     """
@@ -573,33 +573,32 @@ class MLMDataset(Dataset):
     - labels: original token ids (-100 for unmasked positions,
               real token id for masked positions)
     """
-
     def __init__(self, smiles_list, max_length=128, mask_prob=0.15):
         self.smiles_list = smiles_list
         self.max_length = max_length
         self.mask_prob = mask_prob
-
+    
     def __len__(self):
         return len(self.smiles_list)
-
+    
     def __getitem__(self, idx):
         smi = self.smiles_list[idx]
         encoded = encode(smi, self.max_length)  #list of token indices, length 128
-
+        
         input_ids = encoded.copy()
         labels = [-100] * self.max_length  #-100 = ignore in loss by default
-
+        
         for i in range(self.max_length):
             token_id = input_ids[i]
-
+            
             #never mask special tokens or padding
             if token_id in (PAD_IDX, CLS_IDX, UNK_IDX, MASK_IDX):
                 continue
-
+            
             #randomly decide whether to mask this token
             if torch.rand(1).item() < self.mask_prob:
                 labels[i] = token_id  #remember the original token for the loss
-
+                
                 r = torch.rand(1).item()
                 if r < 0.80:
                     #80% replace with [MASK]
@@ -610,7 +609,7 @@ class MLMDataset(Dataset):
                     #start from 4 to skip special tokens
                 #10% keep original token unchanged
                 #but still predict it in the loss
-
+        
         return {
             'input_ids': torch.tensor(input_ids, dtype=torch.long),
             'attention_mask': torch.tensor(
@@ -627,14 +626,13 @@ class MLMHead(nn.Module):
     Takes the full sequence output from the transformer encoder
     (not just CLS) and predicts the original token at each masked position.
     """
-
     def __init__(self, embed_dim, vocab_size):
         super().__init__()
-        self.dense = nn.Linear(embed_dim, embed_dim)
-        self.relu = nn.ReLU()
-        self.norm = nn.LayerNorm(embed_dim)
+        self.dense     = nn.Linear(embed_dim, embed_dim)
+        self.relu      = nn.ReLU()
+        self.norm      = nn.LayerNorm(embed_dim)
         self.projector = nn.Linear(embed_dim, vocab_size)
-
+    
     def forward(self, x):
         #x shape: [batch_size, seq_length, embed_dim]
         x = self.dense(x)
@@ -651,7 +649,6 @@ class TransformerEncoderForMLM(nn.Module):
     Full encoder that returns ALL token outputs (not just CLS),
     needed for MLM since we predict at every masked position.
     """
-
     def __init__(self, vocab_size, embed_dim, num_heads, ff_dim,
                  num_layers, max_length=128, dropout=0.1):
         super().__init__()
@@ -661,13 +658,12 @@ class TransformerEncoderForMLM(nn.Module):
             EncoderLayer(embed_dim, num_heads, ff_dim, dropout)
             for _ in range(num_layers)
         ])
-
+    
     def forward(self, input_ids, attention_mask=None):
         x = self.embedding(input_ids)
         for layer in self.layers:
             x = layer(x, attention_mask)
         return x  #[batch_size, seq_length, embed_dim]—ALL positions
-
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
@@ -679,7 +675,6 @@ class MLMModel(nn.Module):
     encoder (learns representations) + MLM head (predicts masked tokens)
     After pretraining, only the encoder is kept for fine-tuning.
     """
-
     def __init__(self, vocab_size, embed_dim, num_heads, ff_dim,
                  num_layers, max_length=128, dropout=0.1):
         super().__init__()
@@ -688,7 +683,7 @@ class MLMModel(nn.Module):
             num_layers, max_length, dropout
         )
         self.mlm_head = MLMHead(embed_dim, vocab_size)
-
+    
     def forward(self, input_ids, attention_mask=None):
         #get representations for all token positions
         x = self.encoder(input_ids, attention_mask)
@@ -702,13 +697,12 @@ class MLMModel(nn.Module):
 # PRETRAINING SETUP
 # ============================================================
 
-PRETRAIN_SAMPLE = 10_000_000
+PRETRAIN_SAMPLE = 10_000_000  
 
 pubchem_smiles = df['smiles'].dropna().tolist()
 
 #shuffle and take sample
 import random
-
 random.seed(42)
 random.shuffle(pubchem_smiles)
 pubchem_smiles = pubchem_smiles[:PRETRAIN_SAMPLE]
@@ -718,15 +712,15 @@ print(f"Pretraining on {len(pubchem_smiles):,} molecules")
 #split into train/val
 n_pretrain = int(0.95 * len(pubchem_smiles))
 pretrain_smiles = pubchem_smiles[:n_pretrain]
-preval_smiles = pubchem_smiles[n_pretrain:]
+preval_smiles   = pubchem_smiles[n_pretrain:]
 
 pretrain_dataset = MLMDataset(pretrain_smiles, max_length=MAX_LENGTH)
-preval_dataset = MLMDataset(preval_smiles, max_length=MAX_LENGTH)
+preval_dataset   = MLMDataset(preval_smiles,   max_length=MAX_LENGTH)
 
 pretrain_loader = DataLoader(
-    pretrain_dataset, batch_size=64, shuffle=True, num_workers=2)
-preval_loader = DataLoader(
-    preval_dataset, batch_size=64, shuffle=False, num_workers=2)
+    pretrain_dataset, batch_size=128, shuffle=True,  num_workers=4)
+preval_loader   = DataLoader(
+    preval_dataset,   batch_size=128, shuffle=False, num_workers=4)
 
 print(f"Pretrain batches: {len(pretrain_loader):,}")
 print(f"Preval batches:   {len(preval_loader):,}")
@@ -736,17 +730,23 @@ print(f"Preval batches:   {len(preval_loader):,}")
 # ============================================================
 
 PRETRAIN_EPOCHS = 10
-PRETRAIN_LR = 1e-4
+PRETRAIN_LR     = 1e-4
 
 mlm_model = MLMModel(
-    vocab_size=VOCAB_SIZE,
-    embed_dim=EMBED_DIM,
-    num_heads=NUM_HEADS,
-    ff_dim=FF_DIM,
-    num_layers=NUM_LAYERS,
-    max_length=MAX_LENGTH,
-    dropout=DROPOUT
-).to(device)
+    vocab_size = VOCAB_SIZE,
+    embed_dim  = EMBED_DIM,
+    num_heads  = NUM_HEADS,
+    ff_dim     = FF_DIM,
+    num_layers = NUM_LAYERS,
+    max_length = MAX_LENGTH,
+    dropout    = DROPOUT
+)
+
+if torch.cuda.device_count() > 1:
+    print(f"Using {torch.cuda.device_count()} GPUs")
+    mlm_model = nn.DataParallel(mlm_model)
+
+mlm_model = mlm_model.to(device)
 
 pretrain_optimizer = torch.optim.Adam(
     mlm_model.parameters(), lr=PRETRAIN_LR, weight_decay=1e-5)
@@ -758,88 +758,316 @@ criterion_mlm = nn.CrossEntropyLoss(ignore_index=-100)
 best_preval_loss = float('inf')
 
 for epoch in range(PRETRAIN_EPOCHS):
-
-    #train
+    
+    #train 
     mlm_model.train()
-    train_loss = 0.0
-    train_acc = 0.0
+    train_loss  = 0.0
+    train_acc   = 0.0
     train_count = 0
-
+    
     for batch in pretrain_loader:
-        input_ids = batch['input_ids'].to(device)
+        input_ids      = batch['input_ids'].to(device)
         attention_mask = batch['attention_mask'].to(device)
-        labels = batch['labels'].to(device)
-
+        labels         = batch['labels'].to(device)
+        
         pretrain_optimizer.zero_grad()
-
+        
         logits = mlm_model(input_ids, attention_mask)
         #logits shape: [batch, seq_len, vocab_size]
         #labels shape: [batch, seq_len]
-
+        
         #reshape for CrossEntropyLoss:
         #expects [N, C] predictions and [N] targets
         loss = criterion_mlm(
             logits.view(-1, VOCAB_SIZE),
             labels.view(-1)
         )
-
+        
         loss.backward()
         torch.nn.utils.clip_grad_norm_(mlm_model.parameters(), 1.0)
         pretrain_optimizer.step()
-
+        
         #track accuracy on masked tokens only
         masked_positions = labels.view(-1) != -100
         if masked_positions.sum() > 0:
-            preds = logits.view(-1, VOCAB_SIZE).argmax(dim=-1)
-            correct = (preds[masked_positions] ==
-                       labels.view(-1)[masked_positions]).sum().item()
-            train_acc += correct
+            preds   = logits.view(-1, VOCAB_SIZE).argmax(dim=-1)
+            correct = (preds[masked_positions] == 
+                      labels.view(-1)[masked_positions]).sum().item()
+            train_acc   += correct
             train_count += masked_positions.sum().item()
-
+        
         train_loss += loss.item()
-
+    
     train_loss /= len(pretrain_loader)
-    train_acc = train_acc / train_count if train_count > 0 else 0
-
-    #validate
+    train_acc   = train_acc / train_count if train_count > 0 else 0
+    
+    #validate 
     mlm_model.eval()
-    val_loss = 0.0
-    val_acc = 0.0
+    val_loss  = 0.0
+    val_acc   = 0.0
     val_count = 0
-
+    
     with torch.no_grad():
         for batch in preval_loader:
-            input_ids = batch['input_ids'].to(device)
+            input_ids      = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
-            labels = batch['labels'].to(device)
-
+            labels         = batch['labels'].to(device)
+            
             logits = mlm_model(input_ids, attention_mask)
-            loss = criterion_mlm(
+            loss   = criterion_mlm(
                 logits.view(-1, VOCAB_SIZE),
                 labels.view(-1)
             )
             val_loss += loss.item()
-
+            
             masked_positions = labels.view(-1) != -100
             if masked_positions.sum() > 0:
-                preds = logits.view(-1, VOCAB_SIZE).argmax(dim=-1)
-                correct = (preds[masked_positions] ==
-                           labels.view(-1)[masked_positions]).sum().item()
-                val_acc += correct
+                preds   = logits.view(-1, VOCAB_SIZE).argmax(dim=-1)
+                correct = (preds[masked_positions] == 
+                          labels.view(-1)[masked_positions]).sum().item()
+                val_acc   += correct
                 val_count += masked_positions.sum().item()
-
+    
     val_loss /= len(preval_loader)
-    val_acc = val_acc / val_count if val_count > 0 else 0
-
+    val_acc   = val_acc / val_count if val_count > 0 else 0
+    
     if val_loss < best_preval_loss:
         best_preval_loss = val_loss
         #save pretrained encoder weights
-        torch.save(mlm_model.encoder.state_dict(), 'pretrained_encoder.pt')
-        print(f"  → saved best encoder")
-
-    print(f"Epoch {epoch + 1:3d}/{PRETRAIN_EPOCHS}  "
+        encoder_to_save = mlm_model.module.encoder if isinstance(mlm_model, nn.DataParallel) else mlm_model.encoder
+        torch.save(encoder_to_save.state_dict(), '/kaggle/working/pretrained_encoder_10m.pt')
+        torch.save(encoder_to_save.state_dict(), f'/kaggle/working/pretrained_encoder_epoch{epoch+1}.pt')
+        print(f"  → saved to /kaggle/working/pretrained_encoder_10m.pt")
+    
+    print(f"Epoch {epoch+1:3d}/{PRETRAIN_EPOCHS}  "
           f"Train Loss: {train_loss:.4f}  Acc: {train_acc:.3f}  "
           f"Val Loss: {val_loss:.4f}  Acc: {val_acc:.3f}")
 
 print(f"\nPretraining complete. Best val loss: {best_preval_loss:.4f}")
-print(f"Pretrained encoder saved to: pretrained_encoder.pt")
+print(f"Pretrained encoder saved to: /kaggle/working/pretrained_encoder_10m.pt")
+
+
+# ============================================================
+# USING PRETRAINED ENCODER'S WEIGHTS FOR TOXICITY PREDICTION
+# ============================================================
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+def train_and_evaluate(endpoint_name, csv_path, epochs=50, use_pretrained=False):
+    print(f"\n{'='*60}")
+    print(f"Endpoint: {endpoint_name}")
+    if use_pretrained:
+        print(f"Mode: PRETRAINED encoder")
+    else:
+        print(f"Mode: FROM SCRATCH")
+    print(f"{'='*60}")
+    
+    #load data 
+    df_endpoint = pd.read_csv(csv_path)
+    
+    target_col = [c for c in df_endpoint.columns if 'LD50' in c or 'LDLo' in c][0]
+    smiles_col = 'Canonical SMILES' if 'Canonical SMILES' in df_endpoint.columns else 'SMILES'
+    
+    df_endpoint = df_endpoint.dropna(subset=[smiles_col, target_col])
+    print(f"Compounds: {len(df_endpoint)}")
+    
+    smiles = df_endpoint[smiles_col].tolist()
+    labels = df_endpoint[target_col].values
+    
+    #split 
+    idx = np.arange(len(smiles))
+    idx_train, idx_temp = train_test_split(idx, test_size=0.3, random_state=42)
+    idx_val, idx_test   = train_test_split(idx_temp, test_size=0.5, random_state=42)
+    
+    #normalize 
+    train_labels = labels[idx_train]
+    label_mean   = train_labels.mean()
+    label_std    = train_labels.std()
+    labels_norm  = (labels - label_mean) / label_std
+    
+    #datasets
+    train_dataset = ToxicityDataset(
+        [smiles[i] for i in idx_train], labels_norm[idx_train])
+    val_dataset   = ToxicityDataset(
+        [smiles[i] for i in idx_val],   labels_norm[idx_val])
+    test_dataset  = ToxicityDataset(
+        [smiles[i] for i in idx_test],  labels_norm[idx_test])
+    
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+    val_loader   = DataLoader(val_dataset,   batch_size=32, shuffle=False)
+    test_loader  = DataLoader(test_dataset,  batch_size=32, shuffle=False)
+    
+    #model 
+    model = MolecularToxicityModel(
+        vocab_size = VOCAB_SIZE,
+        embed_dim  = EMBED_DIM,
+        num_heads  = NUM_HEADS,
+        ff_dim     = FF_DIM,
+        num_layers = NUM_LAYERS,
+        num_tasks  = 1,
+        max_length = MAX_LENGTH,
+        dropout    = DROPOUT
+    ).to(device)
+    
+    #load pretrained encoder weights if requested
+    PRETRAINED_PATH = '/kaggle/input/notebooks/simonacholakova/molecule-tokenizer/pretrained_encoder.pt'
+
+    if use_pretrained:
+        if not os.path.exists(PRETRAINED_PATH):
+            print(f"  ERROR: {PRETRAINED_PATH} not found!")
+            return None, None
+        model.encoder.load_state_dict(
+            torch.load(PRETRAINED_PATH, map_location=device)
+    )
+        print("Loaded pretrained encoder weights successfully")
+    
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=1e-4, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', patience=3, factor=0.5)
+    criterion = nn.MSELoss()
+    
+    best_val_loss    = float('inf')
+    best_model_state = None
+    
+    #training 
+    for epoch in range(epochs):
+        model.train()
+        train_loss = 0.0
+        for batch in train_loader:
+            input_ids      = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels_batch   = batch['label'].to(device)
+            
+            optimizer.zero_grad()
+            predictions = model(input_ids, attention_mask).squeeze(-1)
+            loss = criterion(predictions, labels_batch)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            train_loss += loss.item()
+        train_loss /= len(train_loader)
+        
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for batch in val_loader:
+                input_ids      = batch['input_ids'].to(device)
+                attention_mask = batch['attention_mask'].to(device)
+                labels_batch   = batch['label'].to(device)
+                predictions = model(input_ids, attention_mask).squeeze(-1)
+                val_loss += criterion(predictions, labels_batch).item()
+        val_loss /= len(val_loader)
+        scheduler.step(val_loss)
+        
+        if val_loss < best_val_loss:
+            best_val_loss    = val_loss
+            best_model_state = {k: v.clone() for k, v in model.state_dict().items()}
+        
+        if (epoch + 1) % 10 == 0:
+            print(f"  Epoch {epoch+1:3d}/{epochs}  "
+                  f"Train: {train_loss:.4f}  Val: {val_loss:.4f}")
+    
+    #test
+    model.load_state_dict(best_model_state)
+    model.eval()
+    
+    all_preds, all_labels_list = [], []
+    with torch.no_grad():
+        for batch in test_loader:
+            input_ids      = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels_batch   = batch['label'].to(device)
+            predictions = model(input_ids, attention_mask).squeeze(-1)
+            all_preds.append(predictions.cpu().numpy())
+            all_labels_list.append(labels_batch.cpu().numpy())
+    
+    all_preds       = np.concatenate(all_preds)       * label_std + label_mean
+    all_labels_list = np.concatenate(all_labels_list) * label_std + label_mean
+    
+    rmse = np.sqrt(np.mean((all_preds - all_labels_list) ** 2))
+    r2   = 1 - np.sum((all_labels_list - all_preds) ** 2) / \
+               np.sum((all_labels_list - all_labels_list.mean()) ** 2)
+    
+    print(f"\n  RMSE: {rmse:.4f}  R2: {r2:.4f}")
+    return rmse, r2
+
+
+# ============================================================
+# FROM SCRATCH + PRETRAINED
+# ============================================================
+
+endpoint_files = {
+    'mouse_oral_LD50':            'Acute Toxicity_mouse_oral_LD50 (1).csv',
+    'mouse_subcutaneous_LD50':    'Acute Toxicity_mouse_subcutaneous_LD50 (1).csv',
+    'mouse_intraperitoneal_LD50': 'Acute Toxicity_mouse_intraperitoneal_LD50 (1).csv',
+    'mouse_intravenous_LD50':     'Acute Toxicity_mouse_intravenous_LD50 (1).csv',
+    'rat_oral_LD50':              'Acute Toxicity_rat_oral_LD50 (1).csv',
+    'rat_intravenous_LD50':       'Acute Toxicity_rat_intravenous_LD50 (1).csv',
+    'rat_intraperitoneal_LD50':   'Acute Toxicity_rat_intraperitoneal_LD50 (1).csv',
+}
+
+DATA_DIR = '/kaggle/input/datasets/simonacholakova/toxric-acute-toxicity/'
+
+print(f"pretrained_encoder.pt exists: {os.path.exists('pretrained_encoder.pt')}")
+
+#from scratch
+print("\n" + "="*60)
+print("PHASE 1: FROM SCRATCH")
+print("="*60)
+
+scratch_results = {}
+for endpoint_name, csv_file in endpoint_files.items():
+    rmse, r2 = train_and_evaluate(
+        endpoint_name,
+        DATA_DIR + csv_file,
+        epochs=50,
+        use_pretrained=False
+    )
+    scratch_results[endpoint_name] = {'rmse': rmse, 'r2': r2}
+
+#PHASE 1: FROM SCRATCH (already ran, hardcoded results)
+scratch_results = {
+    'mouse_oral_LD50':            {'rmse': 0.5312, 'r2': 0.2458},
+    'mouse_subcutaneous_LD50':    {'rmse': 0.7332, 'r2': 0.3530},
+    'mouse_intraperitoneal_LD50': {'rmse': 0.5553, 'r2': 0.3593},
+    'mouse_intravenous_LD50':     {'rmse': 0.5649, 'r2': 0.3782},
+    'rat_oral_LD50':              {'rmse': 0.6914, 'r2': 0.4227},
+    'rat_intravenous_LD50':       {'rmse': 0.8062, 'r2': 0.3774},
+    'rat_intraperitoneal_LD50':   {'rmse': 0.7705, 'r2': 0.2171},
+}
+
+#pretrained encoder 
+print("\n" + "="*60)
+print("PHASE 2: WITH PRETRAINED ENCODER")
+print("="*60)
+
+pretrained_results = {}
+for endpoint_name, csv_file in endpoint_files.items():
+    rmse, r2 = train_and_evaluate(
+        endpoint_name,
+        DATA_DIR + csv_file,
+        epochs=50,
+        use_pretrained=True
+    )
+    pretrained_results[endpoint_name] = {'rmse': rmse, 'r2': r2}
+
+# ============================================================
+# COMPARISON TABLE
+# ============================================================
+
+print(f"\n{'='*75}")
+print(f"FINAL RESULTS: From Scratch vs Pretrained vs TOXRIC Benchmarks")
+print(f"{'='*75}")
+print(f"{'Endpoint':35s} {'Scratch':>10s} {'Pretrained':>12s} {'Diff':>8s} {'Better?':>8s}")
+print(f"{'-'*75}")
+
+for endpoint in scratch_results:
+    r_scratch    = scratch_results[endpoint]['rmse']
+    r_pretrained = pretrained_results[endpoint]['rmse']
+    diff         = r_pretrained - r_scratch
+    better       = '✓ YES' if diff < 0 else '✗ NO'
+    print(f"{endpoint:35s} {r_scratch:10.4f} {r_pretrained:12.4f} "
+          f"{diff:+8.4f} {better:>8s}")
+
