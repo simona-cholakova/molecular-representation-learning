@@ -1,10 +1,12 @@
 import re #for regex
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 import math
 import os
+import numpy as np
+from sklearn.model_selection import train_test_split
 
 # ============================================================
 # VOCABULARY
@@ -125,7 +127,7 @@ for smi in test_smiles:
 # PUBCHEM DATASET LOADING
 # ============================================================
 
-df = pd.read_csv("data\pubchem_10m.csv")
+df = pd.read_csv("data/pubchem_10m.csv")
 
 print(df.columns)
 print(df.head())
@@ -178,29 +180,29 @@ print(f"Output shape: {output.shape}")
 # 1. Positional Embedding
 # -------------------------------------------------------
 
-class PositionalEmbedding(nn.Module):
-    def __init__(self, embed_dim, max_length=128):
-        super().__init__()
-        self.position_embedding = nn.Embedding(max_length, embed_dim)
-        #learnable position vectors, one per position (0 to max_length-1)
-        #creates lookup table with 128 rows (one per position) and 128 columns (one number per dimension)
+# class PositionalEmbedding(nn.Module):
+#     def __init__(self, embed_dim, max_length=128):
+#         super().__init__()
+#         self.position_embedding = nn.Embedding(max_length, embed_dim)
+#         #learnable position vectors, one per position (0 to max_length-1)
+#         #creates lookup table with 128 rows (one per position) and 128 columns (one number per dimension)
     
-    def forward(self, x): #x is output from token embedding
-        batch_size, seq_length, _ = x.shape
-        #x shape: [batch_size, seq_length, embed_dim]
+#     def forward(self, x): #x is output from token embedding
+#         batch_size, seq_length, _ = x.shape
+#         #x shape: [batch_size, seq_length, embed_dim]
 
-        positions = torch.arange(seq_length)
-        #create position indices [0,1,2,...,seq_length-1]
-        #position 0 is [CLS] token, position 1 is the first atom...
+#         positions = torch.arange(seq_length)
+#         #create position indices [0,1,2,...,seq_length-1]
+#         #position 0 is [CLS] token, position 1 is the first atom...
 
-        pos_embeddings = self.position_embedding(positions)
-        #look up position vectors
-        #result matrix: [seq_length, embed_dim]
-        #so each position returns its 128-number vector
+#         pos_embeddings = self.position_embedding(positions)
+#         #look up position vectors
+#         #result matrix: [seq_length, embed_dim]
+#         #so each position returns its 128-number vector
         
-        return x + pos_embeddings
-        #add position embeddings to token embeddings
-        #pos_embeddings gets broadcast across the batch dimension
+#         return x + pos_embeddings
+#         #add position embeddings to token embeddings
+#         #pos_embeddings gets broadcast across the batch dimension
 
 
 
@@ -209,25 +211,16 @@ class PositionalEmbedding(nn.Module):
 # -------------------------------------------------------
 
 class MoleculeEmbedding(nn.Module):
-    def __init__(self, vocab_size, embed_dim, max_length=128, dropout=0.1):
+    def __init__(self, vocab_size, embed_dim, dropout=0.1):
         super().__init__()
         self.token_embedding = TokenEmbedding(vocab_size, embed_dim) #token IDs to vectors
-        self.positional_embedding = PositionalEmbedding(embed_dim, max_length) #position indicies to vectors and adds the token vectors
+        #self.positional_embedding = PositionalEmbedding(embed_dim, max_length) #position indicies to vectors and adds the token vectors
         self.dropout = nn.Dropout(dropout) #creates a dropout layer with 10% of values set to 0 randomly, prevents overfitting
         #during evaluation, dropout is automatically turned off
 
     def forward(self, input_ids):
-        #input_ids shape: [batch_size, seq_length]
+        x = self.token_embedding(input_ids)
 
-        #step 1: convert token IDs to vectors 
-        token_embeds = self.token_embedding(input_ids)
-        #shape: [batch_size, seq_length, embed_dim]
-
-        #step 2: add positional info
-        x = self.positional_embedding(token_embeds)
-        #shape: [batch_size, seq_length, embed_dim]
-
-        #step 3: dropout 
         x = self.dropout(x)
 
         return x
@@ -245,7 +238,6 @@ DROPOUT = 0.1
 embedding_layer = MoleculeEmbedding(
     vocab_size = VOCAB_SIZE,
     embed_dim = EMBED_DIM,
-    max_length = MAX_LENGTH,
     dropout = DROPOUT
 )
 
@@ -264,6 +256,60 @@ print(f"Embedded output shape: {sample_embedded.shape}")
 print(f"\n[CLS] token index in first molecule: {sample_encoded[0][0].item()} (should be {CLS_IDX})")
 print(f"[CLS] embedding vector (first 5 values): {sample_embedded[0][0][:5].detach().numpy()}")
 
+# ============================================================
+# RoPE positional embedding
+# ============================================================
+
+def rotate_half(x):
+    x1 = x[..., ::2]
+    x2 = x[..., 1::2]
+
+    return torch.stack((-x2, x1), dim=-1).flatten(-2)
+
+def apply_rotary(x, cos, sin):
+    x_even = x[..., ::2]
+    x_odd = x[..., 1::2]
+
+    x_rot = torch.stack(
+        [
+            x_even * cos - x_odd * sin,
+            x_even * sin + x_odd * cos,
+        ],
+        dim=-1,
+    )
+
+    return x_rot.flatten(-2)
+
+class RotaryEmbedding(nn.Module):
+    def __init__(self, head_dim, max_length=128):
+        super().__init__()
+
+        inv_freq = 1.0 / (
+            10000 ** (torch.arange(0, head_dim, 2).float() / head_dim)
+        )
+
+        positions = torch.arange(max_length).float()
+
+        freqs = torch.outer(positions, inv_freq)
+
+        self.register_buffer("cos", freqs.cos())
+        self.register_buffer("sin", freqs.sin())
+
+    def forward(self, q, k):
+        """
+        q,k:
+        [batch, heads, seq_len, head_dim]
+        """
+
+        seq_len = q.shape[2]
+
+        cos = self.cos[:seq_len].unsqueeze(0).unsqueeze(0)
+        sin = self.sin[:seq_len].unsqueeze(0).unsqueeze(0)
+
+        q = apply_rotary(q, cos, sin)
+        k = apply_rotary(k, cos, sin)
+
+        return q, k
 
 # ============================================================
 # TRANSFORMER ENCODER
@@ -290,6 +336,7 @@ class MultiHeadAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
         self.scale = math.sqrt(self.head_dim) #scaling factor to prevent large dot products 
+        self.rope = RotaryEmbedding(self.head_dim)
 
     def forward(self, x, attention_mask=None):
         #x shape: [batch_size, seq_length, embed_dim]
@@ -307,6 +354,7 @@ class MultiHeadAttention(nn.Module):
         Q = Q.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1,2)
         K = K.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1,2)
         V = V.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1,2)
+        Q, K = self.rope(Q, K)
 
         #Step 3: compute attention scores
         #shape: [batch_size, num_heads, seq_length, seq_length]
@@ -394,7 +442,7 @@ class TransformerEncoder(nn.Module):
         super().__init__()
 
         #embedding layer (token + positional)
-        self.embedding = MoleculeEmbedding(vocab_size, embed_dim, max_length, dropout)
+        self.embedding = MoleculeEmbedding(vocab_size, embed_dim, dropout)
 
         #N encoder layers
         self.layers = nn.ModuleList([
@@ -520,7 +568,7 @@ class MolecularToxicityModel(nn.Module):
 # LOAD TOXRIC ENDPOINT
 # ============================================================
 
-toxric = pd.read_csv('data\Acute Toxicity_mouse_oral_LD50.csv')
+toxric = pd.read_csv('data/Acute Toxicity_mouse_oral_LD50.csv')
 
 print(f"Total compounds: {len(toxric)}")
 print(f"Columns: {toxric.columns.tolist()}")
@@ -545,7 +593,7 @@ class ToxicityDataset(Dataset):
     def __len__(self):
         return len(self.smiles_list)
 
-    def __getitem(self, idx):
+    def __getitem__(self, idx):
         smi = self.smiles_list[idx]
         encoded = encode(smi, self.max_length)
 
@@ -650,10 +698,10 @@ class TransformerEncoderForMLM(nn.Module):
     needed for MLM since we predict at every masked position.
     """
     def __init__(self, vocab_size, embed_dim, num_heads, ff_dim,
-                 num_layers, max_length=128, dropout=0.1):
+                 num_layers, dropout=0.1):
         super().__init__()
         self.embedding = MoleculeEmbedding(
-            vocab_size, embed_dim, max_length, dropout)
+            vocab_size, embed_dim, dropout)
         self.layers = nn.ModuleList([
             EncoderLayer(embed_dim, num_heads, ff_dim, dropout)
             for _ in range(num_layers)
@@ -680,7 +728,7 @@ class MLMModel(nn.Module):
         super().__init__()
         self.encoder = TransformerEncoderForMLM(
             vocab_size, embed_dim, num_heads, ff_dim,
-            num_layers, max_length, dropout
+            num_layers, dropout
         )
         self.mlm_head = MLMHead(embed_dim, vocab_size)
     
