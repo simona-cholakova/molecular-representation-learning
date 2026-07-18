@@ -1,3 +1,4 @@
+import random
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -17,7 +18,8 @@ from sklearn.model_selection import GridSearchCV
 from tokenizers.processors import TemplateProcessing
 import json
 import joblib
-from sklearn.model_selection import RandomizedSearchCV
+from rdkit import Chem
+from rdkit.Chem import rdmolops
 
 
 # ============================================================
@@ -411,14 +413,14 @@ class TransformerEncoder(nn.Module):
 # TRANSFORMER VALUES
 # ============================================================
 
-EMBED_DIM = 256
+EMBED_DIM = 512
 NUM_HEADS = 8
 FF_DIM = 1024
 NUM_LAYERS = 6
 MAX_LENGTH = 128
 DROPOUT = 0.15
 
-RUN_CHECKPOINTS_DIR = os.path.join(CHECKPOINTS_DIR, "dim256_newtok")
+RUN_CHECKPOINTS_DIR = os.path.join(CHECKPOINTS_DIR, 'dim512', 'augmented_smiles')
 os.makedirs(RUN_CHECKPOINTS_DIR, exist_ok=True)
 
 # ============================================================
@@ -508,6 +510,18 @@ class UnlabeledSMILESDataset(Dataset):
 
 PRETRAINED_ENCODER_PATH = os.path.join(RUN_CHECKPOINTS_DIR, 'pretrained_encoder_mlm.pt')
 
+FREEZE_ENCODER = False  #flip this to compare
+
+def get_pretrained_encoder_frozen(device):
+    """Load the MLM-pretrained encoder with no supervised fine-tuning."""
+    encoder = TransformerEncoder(
+        vocab_size=VOCAB_SIZE, embed_dim=EMBED_DIM, num_heads=NUM_HEADS,
+        ff_dim=FF_DIM, num_layers=NUM_LAYERS, max_length=MAX_LENGTH, dropout=DROPOUT
+    ).to(device)
+    state_dict = torch.load(PRETRAINED_ENCODER_PATH, map_location=device, weights_only=True)
+    encoder.load_state_dict(state_dict)
+    encoder.eval()
+    return encoder
 
 def pretrain_encoder_mlm(smiles_list, device, num_epochs=5, batch_size=256, lr=1e-4):
     """
@@ -658,9 +672,51 @@ class ToxicityDataset(Dataset):
             'attention_mask': attention_mask,
             'label': label
         }
+    
+# ============================================================
+# SMILES AUGMENTATION
+# ============================================================
+
+def augment_smiles(smiles, n=4, seed=None):
+    """
+    Generate n different valid SMILES strings for the same molecule
+    by randomly reordering atoms. Returns list including canonical SMILES.
+    """
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return [smiles]
+
+    rng = random.Random(seed)
+    augmented = set()
+    augmented.add(Chem.MolToSmiles(mol))  #always include canonical
+
+    attempts = 0
+    while len(augmented) < n + 1 and attempts < n * 5:
+        new_order = list(range(mol.GetNumAtoms()))
+        rng.shuffle(new_order)
+        new_mol = rdmolops.RenumberAtoms(mol, new_order)
+        augmented.add(Chem.MolToSmiles(new_mol, canonical=False))
+        attempts += 1
+
+    return list(augmented)
+
+
+def augment_dataset(smiles_list, labels, n=4):
+    """
+    Expand dataset by generating n augmented SMILES per molecule.
+    Each variant gets the same label as the original.
+    Only use on training set. NEVER val or test.
+    """
+    aug_smiles = []
+    aug_labels = []
+    for smi, lbl in zip(smiles_list, labels):
+        variants = augment_smiles(smi, n=n)
+        aug_smiles.extend(variants)
+        aug_labels.extend([lbl] * len(variants))
+    return aug_smiles, np.array(aug_labels)
 
 # ============================================================
-# SUPERVISED ENCODER TRAINING (encoder + predictor, end-to-end)
+# SUPERVISED ENCODER TRAINING 
 # ============================================================
 
 def train_encoder_supervised(train_smiles, train_labels, val_smiles, val_labels,
@@ -670,6 +726,11 @@ def train_encoder_supervised(train_smiles, train_labels, val_smiles, val_labels,
     Training MolecularToxicityModel (encoder + prediction head)
     on the toxicity regression task. Returns the model
     """
+    #augment training set only
+    print(f"  Augmenting training set ({len(train_smiles):,} → ", end='')
+    train_smiles, train_labels = augment_dataset(train_smiles, train_labels, n=4)
+    print(f"{len(train_smiles):,} samples after 4x augmentation)")
+
     train_dataset = ToxicityDataset(train_smiles, train_labels, max_length=MAX_LENGTH)
     val_dataset = ToxicityDataset(val_smiles, val_labels, max_length=MAX_LENGTH)
 
@@ -820,6 +881,7 @@ def extract_cls_vectors(smiles_list, encoder, device, batch_size=256):
 
     return np.concatenate(all_cls, axis=0)
 
+
 def train_xgboost_with_transformer(endpoint_name, csv_path, device):
 
     print(f"\n{'='*60}")
@@ -852,34 +914,66 @@ def train_xgboost_with_transformer(endpoint_name, csv_path, device):
     val_labels   = labels[idx_val]
     test_labels  = labels[idx_test]
 
-    #train encoder 
-    print(f"\nTraining transformer encoder on {endpoint_name}...")
-    full_model = train_encoder_supervised(
-        train_smiles, train_labels,
-        val_smiles,   val_labels,
-        device = device
-    )
-    encoder = full_model.encoder
-
-    #baseline: how good is the transformer's own prediction, unaided?
-    baseline_rmse, baseline_r2 = evaluate_full_model(full_model, test_smiles, test_labels, device)
-    print(f"\nBaseline (transformer alone): RMSE={baseline_rmse:.4f}, R2={baseline_r2:.4f}")
-
-    #save the trained encoder 
+    #define encoder path first so we can check if it exists
     endpoint_encoder_path = os.path.join(
         RUN_CHECKPOINTS_DIR, f'encoder_{endpoint_name}.pt'
     )
-    torch.save(encoder.state_dict(), endpoint_encoder_path)
-    print(f"Saved trained encoder to {endpoint_encoder_path}")
 
-    #extract CLS vectors using the now-trained encoder
+    if FREEZE_ENCODER:
+        #skip fine-tuning entirely, use MLM-pretrained encoder as-is
+        print(f"\nUsing frozen pretrained encoder (no fine-tuning) for {endpoint_name}...")
+        encoder = get_pretrained_encoder_frozen(device)
+        baseline_rmse, baseline_r2 = None, None
+
+    elif os.path.exists(endpoint_encoder_path):
+        #skip training, load existing fine-tuned encoder
+        print(f"\nFound existing fine-tuned encoder for {endpoint_name}, loading...")
+        full_model = MolecularToxicityModel(
+            vocab_size = VOCAB_SIZE,
+            embed_dim  = EMBED_DIM,
+            num_heads  = NUM_HEADS,
+            ff_dim     = FF_DIM,
+            num_layers = NUM_LAYERS,
+            num_tasks  = 1,
+            max_length = MAX_LENGTH,
+            dropout    = DROPOUT
+        ).to(device)
+        full_model.encoder.load_state_dict(
+            torch.load(endpoint_encoder_path, map_location=device,
+                      weights_only=True))
+        encoder = full_model.encoder
+        baseline_rmse, baseline_r2 = evaluate_full_model(
+            full_model, test_smiles, test_labels, device)
+        print(f"Baseline (transformer alone): RMSE={baseline_rmse:.4f}, R2={baseline_r2:.4f}")
+
+    else:
+        #train encoder from pretrained MLM encoder
+        print(f"\nTraining transformer encoder on {endpoint_name}...")
+        full_model = train_encoder_supervised(
+            train_smiles, train_labels,
+            val_smiles,   val_labels,
+            device = device
+        )
+        encoder = full_model.encoder
+        baseline_rmse, baseline_r2 = evaluate_full_model(
+            full_model, test_smiles, test_labels, device)
+        print(f"\nBaseline (transformer alone): RMSE={baseline_rmse:.4f}, R2={baseline_r2:.4f}")
+        torch.save(encoder.state_dict(), endpoint_encoder_path)
+        print(f"Saved trained encoder to {endpoint_encoder_path}")
+
+    #extract CLS vectors using the (frozen or fine-tuned) encoder
     print(f"\nExtracting CLS vectors...")
     print(f"  Train ({len(train_smiles):,}):")
-    X_train = extract_cls_vectors(train_smiles, encoder, device)
+    X_train_cls = extract_cls_vectors(train_smiles, encoder, device)
     print(f"  Val ({len(val_smiles):,}):")
-    X_val   = extract_cls_vectors(val_smiles,   encoder, device)
+    X_val_cls   = extract_cls_vectors(val_smiles,   encoder, device)
     print(f"  Test ({len(test_smiles):,}):")
-    X_test  = extract_cls_vectors(test_smiles,  encoder, device)
+    X_test_cls  = extract_cls_vectors(test_smiles,  encoder, device)
+
+    #use CLS vectors only 
+    X_train = X_train_cls
+    X_val   = X_val_cls
+    X_test  = X_test_cls
 
     X_trainval = np.concatenate([X_train, X_val], axis=0)
     y_trainval = np.concatenate([train_labels, val_labels], axis=0)
@@ -889,9 +983,11 @@ def train_xgboost_with_transformer(endpoint_name, csv_path, device):
     #GridSearchCV
     print("\nRunning GridSearchCV (5-fold CV)...")
     param_grid = {
-        "n_estimators": [200, 500],
-        "max_depth": [4, 6],
-        "learning_rate": [0.05, 0.1],
+        'n_estimators':     [500, 1000, 2000],
+        'max_depth':        [4, 6, 8],
+        'learning_rate':    [0.01, 0.05, 0.1],
+        'subsample':        [0.8],
+        'colsample_bytree': [0.8],
     }
     xgb_base = XGBRegressor(random_state=42, n_jobs=4, verbosity=0, eval_metric='rmse')
     grid_search = GridSearchCV(
@@ -933,7 +1029,6 @@ def train_xgboost_with_transformer(endpoint_name, csv_path, device):
     print(f"R2:   {r2:.4f}")
 
     return rmse, r2, baseline_rmse, baseline_r2, grid_search.best_estimator_, grid_search.best_params_
-
 
 # ============================================================
 # RUN
